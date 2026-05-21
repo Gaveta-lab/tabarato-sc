@@ -1,151 +1,108 @@
 """
 Scraper Koch Supermercados
-O Koch usa a plataforma Osuper que expõe uma API interna.
-Fazemos requisições direto à API deles.
+Usa a API interna da Osuper (sense.osuper.com.br) — sem autenticação.
+IDs: plataforma=295, loja=1415 (Camboriú Centro)
 """
 import httpx
-import re
 from datetime import datetime
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'pt-BR,pt;q=0.9',
+    'Origin': 'https://www.superkoch.com.br',
     'Referer': 'https://www.superkoch.com.br/',
 }
 
-# API interna da plataforma Osuper usada pelo Koch
-# Descoberta via DevTools do browser
-KOCH_API = 'https://www.superkoch.com.br/api/catalog/products'
-KOMPRAO_API = 'https://www.kompraokoch.com.br/api/catalog/products'
+OSUPER_SEARCH = 'https://sense.osuper.com.br/295/1415/search'
+PAGE_SIZE = 48
 
 
 async def scrape_ofertas_koch() -> list[dict]:
-    """Busca ofertas do Koch via API interna da Osuper."""
+    """Busca todas as ofertas do Koch via API Osuper."""
     ofertas = []
-    page = 1
-    
-    async with httpx.AsyncClient(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+    from_idx = 0
+
+    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
         while True:
             try:
-                resp = await client.get(KOCH_API, params={
-                    'sort': 'relevance',
-                    'page': page,
-                    'per_page': 48,
-                    'filters': 'offer:true',
+                resp = await client.get(OSUPER_SEARCH, params={
+                    'promotion': 'true',
+                    'brands': '',
+                    'categories': '',
+                    'tags': '',
+                    'onlyPersonas': 'false',
+                    'cashback': 'false',
+                    'hidePersonas': '690',
+                    'size': PAGE_SIZE,
+                    'from': from_idx,
+                    'search': '',
+                    'sortField': 'sales_count',
+                    'sortOrder': 'desc',
                 })
                 if resp.status_code != 200:
+                    print(f'[Koch] HTTP {resp.status_code}')
                     break
+
                 data = resp.json()
-                produtos = data.get('products', data.get('items', data.get('data', [])))
-                if not produtos:
+                hits = data.get('hits', [])
+                if not hits:
                     break
-                for p in produtos:
-                    oferta = _parse_produto_osuper(p, 'Koch')
+
+                for p in hits:
+                    oferta = _parse_produto(p)
                     if oferta:
                         ofertas.append(oferta)
-                # Checar se tem mais páginas
-                total = data.get('total', data.get('count', 0))
-                if page * 48 >= total or len(produtos) < 48:
-                    break
-                page += 1
-            except Exception as e:
-                print(f'[Koch] Erro página {page}: {e}')
-                break
 
-    # Fallback: scraping HTML se API não retornar nada
-    if not ofertas:
-        ofertas = await _scrape_html_koch(client if 'client' in dir() else None)
+                # Checar se tem mais páginas
+                has_more = hits[-1].get('hasMore', False) if hits else False
+                if not has_more or len(hits) < PAGE_SIZE:
+                    break
+                from_idx += PAGE_SIZE
+
+            except Exception as e:
+                print(f'[Koch] Erro offset {from_idx}: {e}')
+                break
 
     print(f'[Koch] {len(ofertas)} ofertas coletadas')
     return ofertas
 
 
-async def _scrape_html_koch(client=None) -> list[dict]:
-    """Fallback: scraping via HTML da página de ofertas."""
-    from bs4 import BeautifulSoup
-    ofertas = []
-    urls = [
-        'https://www.superkoch.com.br/promocoes',
-        'https://www.superkoch.com.br/ofertas',
-    ]
-    async with httpx.AsyncClient(headers=HEADERS, timeout=30, follow_redirects=True) as c:
-        for url in urls:
-            try:
-                resp = await c.get(url)
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                # Buscar cards de produto (estrutura comum do Osuper)
-                cards = soup.select('[class*="product-card"], [class*="ProductCard"], [class*="product-item"]')
-                for card in cards:
-                    nome_el = card.select_one('[class*="name"], [class*="title"], h2, h3')
-                    preco_el = card.select_one('[class*="price-offer"], [class*="special-price"], [class*="promo"]')
-                    preco_orig_el = card.select_one('[class*="price-original"], [class*="old-price"], s, del')
-                    img_el = card.select_one('img')
-                    if not nome_el or not preco_el:
-                        continue
-                    nome = nome_el.get_text(strip=True)
-                    preco = _parse_preco(preco_el.get_text(strip=True))
-                    preco_orig = _parse_preco(preco_orig_el.get_text(strip=True)) if preco_orig_el else None
-                    imagem = img_el.get('src') or img_el.get('data-src') if img_el else None
-                    if nome and preco:
-                        ofertas.append({
-                            'rede': 'Koch',
-                            'nome': nome,
-                            'preco': preco,
-                            'preco_original': preco_orig,
-                            'desconto_pct': _calc_desconto(preco, preco_orig),
-                            'imagem': imagem,
-                            'categoria': None,
-                            'validade': None,
-                            'url_produto': url,
-                            'atualizado_em': datetime.now().isoformat(),
-                        })
-            except Exception as e:
-                print(f'[Koch HTML] Erro em {url}: {e}')
-    return ofertas
-
-
-def _parse_produto_osuper(p: dict, rede: str) -> dict | None:
-    """Converte produto da API Osuper para nosso formato."""
+def _parse_produto(p: dict) -> dict | None:
     try:
-        nome = p.get('name') or p.get('title') or p.get('product_name')
+        nome = p.get('name', '').strip()
         if not nome:
             return None
-        preco = float(p.get('special_price') or p.get('price') or p.get('sale_price') or 0)
-        preco_orig = float(p.get('price') or p.get('original_price') or p.get('regular_price') or 0)
-        if preco == 0:
+
+        pricing = p.get('pricing', {})
+        preco_original = pricing.get('price')
+        preco_promo    = pricing.get('promotionalPrice')
+        desconto       = pricing.get('discount')  # já vem em % (ex: 22)
+
+        # Usar preço promocional se disponível, senão preço normal
+        preco = preco_promo if preco_promo else preco_original
+        if not preco:
             return None
-        if preco_orig and preco_orig <= preco:
-            preco_orig = None
-        imagem = (p.get('images') or [{}])[0].get('url') if p.get('images') else p.get('image')
+
+        # Categoria — pegar a mais específica
+        categorias = p.get('categories', [])
+        categoria = None
+        if categorias:
+            partes = categorias[0].replace(f'store1415:', '').split(' > ')
+            categoria = partes[-1] if partes else None
+
         return {
-            'rede': rede,
+            'rede': 'Koch',
             'nome': nome,
-            'preco': preco,
-            'preco_original': preco_orig if preco_orig and preco_orig != preco else None,
-            'desconto_pct': _calc_desconto(preco, preco_orig),
-            'imagem': imagem,
-            'categoria': p.get('category') or p.get('department'),
-            'validade': p.get('promotion_end') or p.get('valid_until'),
-            'url_produto': p.get('url') or p.get('link'),
+            'preco': float(preco),
+            'preco_original': float(preco_original) if preco_original and preco_original != preco else None,
+            'desconto_pct': int(desconto) if desconto else None,
+            'imagem': p.get('image'),
+            'categoria': categoria,
+            'validade': None,
+            'url_produto': f'https://www.superkoch.com.br/produto/{p.get("slug", "")}',
             'atualizado_em': datetime.now().isoformat(),
         }
-    except Exception:
+    except Exception as e:
+        print(f'[Koch] Erro parse: {e}')
         return None
-
-
-def _parse_preco(texto: str) -> float | None:
-    try:
-        nums = re.findall(r'[\d,\.]+', texto.replace(',', '.'))
-        return float(nums[-1]) if nums else None
-    except Exception:
-        return None
-
-
-def _calc_desconto(preco: float, preco_orig: float | None) -> int | None:
-    try:
-        if preco_orig and preco_orig > preco:
-            return int((1 - preco / preco_orig) * 100)
-    except Exception:
-        pass
-    return None
