@@ -2,6 +2,7 @@
 Scraper Koch Supermercados
 Usa a API interna da Osuper (sense.osuper.com.br) — sem autenticação.
 IDs: plataforma=295, loja=1415 (Camboriú Centro)
+Busca o catálogo completo de produtos com preços.
 """
 import httpx
 from datetime import datetime
@@ -19,7 +20,7 @@ PAGE_SIZE = 48
 
 
 async def scrape_ofertas_koch() -> list[dict]:
-    """Busca todas as ofertas do Koch via API Osuper."""
+    """Busca catálogo completo do Koch via API Osuper."""
     ofertas = []
     from_idx = 0
 
@@ -27,7 +28,7 @@ async def scrape_ofertas_koch() -> list[dict]:
         while True:
             try:
                 resp = await client.get(OSUPER_SEARCH, params={
-                    'promotion': 'true',
+                    'promotion': 'false',   # catálogo completo
                     'brands': '',
                     'categories': '',
                     'tags': '',
@@ -54,17 +55,18 @@ async def scrape_ofertas_koch() -> list[dict]:
                     if oferta:
                         ofertas.append(oferta)
 
-                # Checar se tem mais páginas
                 has_more = hits[-1].get('hasMore', False) if hits else False
                 if not has_more or len(hits) < PAGE_SIZE:
                     break
                 from_idx += PAGE_SIZE
 
+                print(f'[Koch] {from_idx} produtos carregados...')
+
             except Exception as e:
                 print(f'[Koch] Erro offset {from_idx}: {e}')
                 break
 
-    print(f'[Koch] {len(ofertas)} ofertas coletadas')
+    print(f'[Koch] Total: {len(ofertas)} produtos coletados')
     return ofertas
 
 
@@ -77,10 +79,11 @@ def _parse_produto(p: dict) -> dict | None:
         pricing = p.get('pricing', {})
         preco_original = pricing.get('price')
         preco_promo    = pricing.get('promotionalPrice')
-        desconto       = pricing.get('discount')  # já vem em % (ex: 22)
+        desconto       = pricing.get('discount')
+        em_promocao    = pricing.get('promotion', False)
 
-        # Usar preço promocional se disponível, senão preço normal
-        preco = preco_promo if preco_promo else preco_original
+        # Preço atual: promocional se disponível, senão normal
+        preco = preco_promo if (em_promocao and preco_promo) else preco_original
         if not preco:
             return None
 
@@ -88,15 +91,15 @@ def _parse_produto(p: dict) -> dict | None:
         categorias = p.get('categories', [])
         categoria = None
         if categorias:
-            partes = categorias[0].replace(f'store1415:', '').split(' > ')
+            partes = categorias[0].replace('store1415:', '').split(' > ')
             categoria = partes[-1] if partes else None
 
         return {
             'rede': 'Koch',
             'nome': nome,
             'preco': float(preco),
-            'preco_original': float(preco_original) if preco_original and preco_original != preco else None,
-            'desconto_pct': int(desconto) if desconto else None,
+            'preco_original': float(preco_original) if em_promocao and preco_original and preco_original != preco else None,
+            'desconto_pct': int(desconto) if em_promocao and desconto else None,
             'imagem': p.get('image'),
             'categoria': categoria,
             'validade': None,
