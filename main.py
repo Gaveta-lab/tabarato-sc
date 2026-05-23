@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime
 from contextlib import asynccontextmanager
+from sqlalchemy import or_, func
 import asyncio
 
 from models.database import SessionLocal, Oferta, Base, engine
@@ -20,7 +21,6 @@ scheduler = AsyncIOScheduler()
 
 
 async def atualizar_todas_ofertas():
-    """Roda diariamente para manter ofertas atualizadas."""
     print(f'[Scheduler] Iniciando atualização — {datetime.now()}')
     db = SessionLocal()
     try:
@@ -28,7 +28,6 @@ async def atualizar_todas_ofertas():
         ofertas_bistek = await scrape_ofertas_bistek()
         ofertas_outras = await scrape_todas_redes()
         todas = ofertas_koch + ofertas_bistek + ofertas_outras
-
         if todas:
             db.query(Oferta).delete()
             for o in todas:
@@ -55,7 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title='Tá Barato SC',
     description='API de ofertas de supermercados de SC',
-    version='1.0.0',
+    version='1.1.0',
     lifespan=lifespan,
 )
 
@@ -67,9 +66,46 @@ app.add_middleware(
 )
 
 
+def _filtro_palavras(q: str):
+    """
+    Gera filtros para busca por múltiplas palavras.
+    Ex: 'arroz 5kg' → busca registros que contenham 'arroz' E '5kg' no nome.
+    """
+    palavras = [p.strip() for p in q.split() if len(p.strip()) >= 2]
+    if not palavras:
+        return [Oferta.nome.ilike(f'%{q}%')]
+    return [Oferta.nome.ilike(f'%{p}%') for p in palavras]
+
+
 @app.get('/health')
 def health():
     return {'ok': True, 'ts': datetime.now().isoformat()}
+
+
+@app.get('/sugerir')
+def sugerir(q: str = Query(..., min_length=2)):
+    """Retorna sugestões rápidas de nomes para autocomplete."""
+    db = SessionLocal()
+    try:
+        filtros = _filtro_palavras(q)
+        nomes = (
+            db.query(Oferta.nome)
+            .filter(*filtros)
+            .order_by(Oferta.nome)
+            .limit(10)
+            .all()
+        )
+        # Deduplicar por nome normalizado (sem tamanho/embalagem)
+        vistos = set()
+        sugestoes = []
+        for (nome,) in nomes:
+            chave = nome[:30].lower()
+            if chave not in vistos:
+                vistos.add(chave)
+                sugestoes.append(nome)
+        return {'sugestoes': sugestoes[:8]}
+    finally:
+        db.close()
 
 
 @app.get('/ofertas')
@@ -85,7 +121,8 @@ def listar_ofertas(
     try:
         query = db.query(Oferta)
         if q:
-            query = query.filter(Oferta.nome.ilike(f'%{q}%'))
+            filtros = _filtro_palavras(q)
+            query = query.filter(*filtros)
         if rede:
             query = query.filter(Oferta.rede.ilike(f'%{rede}%'))
         if categoria:
@@ -108,46 +145,157 @@ def listar_ofertas(
 
 
 @app.get('/buscar')
-def buscar_produto(q: str = Query(...)):
-    if len(q) < 2:
+def buscar_produto(
+    q: str = Query(...),
+    por_rede: int = Query(5, ge=1, le=20),
+):
+    """
+    Busca por múltiplas palavras e retorna resultados balanceados por rede.
+    Ex: 'arroz 5kg' → encontra produtos com 'arroz' E '5kg' no nome.
+    """
+    if len(q.strip()) < 2:
         raise HTTPException(400, 'Busca muito curta')
+
     db = SessionLocal()
     try:
-        ofertas = db.query(Oferta).filter(Oferta.nome.ilike(f'%{q}%')).order_by(Oferta.preco.asc()).all()
-        if not ofertas:
-            return {'produto': q, 'encontrado': False, 'resultados': []}
+        filtros = _filtro_palavras(q)
+        todas = (
+            db.query(Oferta)
+            .filter(*filtros)
+            .order_by(Oferta.preco.asc())
+            .all()
+        )
 
-        por_rede = {}
-        for o in ofertas:
-            if o.rede not in por_rede:
-                por_rede[o.rede] = o
+        # Se não encontrou com todas as palavras, tenta só a primeira
+        if not todas and len(q.split()) > 1:
+            primeira = q.split()[0]
+            todas = (
+                db.query(Oferta)
+                .filter(Oferta.nome.ilike(f'%{primeira}%'))
+                .order_by(Oferta.preco.asc())
+                .all()
+            )
+
+        if not todas:
+            return {'produto': q, 'encontrado': False, 'todos': [], 'por_rede': []}
+
+        # Balancear: até `por_rede` produtos de cada rede
+        contagem = {}
+        balanceados = []
+        for o in todas:
+            cnt = contagem.get(o.rede, 0)
+            if cnt < por_rede:
+                balanceados.append(o)
+                contagem[o.rede] = cnt + 1
+
+        # Melhor preço geral
+        com_preco = [o for o in todas if o.preco is not None]
+        melhor = com_preco[0] if com_preco else todas[0]
+
+        # Melhor por rede (mais barato de cada)
+        por_rede_dict = {}
+        for o in todas:
+            if o.rede not in por_rede_dict and o.preco is not None:
+                por_rede_dict[o.rede] = o
 
         return {
             'produto': q,
             'encontrado': True,
-            'melhor_preco': _oferta_dict(ofertas[0]),
-            'por_rede': [_oferta_dict(o) for o in por_rede.values()],
-            'todos': [_oferta_dict(o) for o in ofertas[:20]],
+            'total': len(todas),
+            'melhor_preco': _oferta_dict(melhor),
+            'por_rede': [_oferta_dict(o) for o in por_rede_dict.values()],
+            'todos': [_oferta_dict(o) for o in balanceados],
         }
+    finally:
+        db.close()
+
+
+@app.get('/produto/{produto_id}')
+def detalhe_produto(produto_id: int):
+    """Retorna um produto e mostra o mesmo produto em outras redes."""
+    db = SessionLocal()
+    try:
+        produto = db.query(Oferta).filter(Oferta.id == produto_id).first()
+        if not produto:
+            raise HTTPException(404, 'Produto não encontrado')
+
+        # Buscar produto similar em outras redes (primeiras 3 palavras do nome)
+        palavras = produto.nome.split()[:3]
+        filtros  = [Oferta.nome.ilike(f'%{p}%') for p in palavras if len(p) >= 3]
+
+        similares = []
+        if filtros:
+            por_rede = {}
+            todos = (
+                db.query(Oferta)
+                .filter(*filtros, Oferta.id != produto_id)
+                .order_by(Oferta.preco.asc())
+                .all()
+            )
+            for o in todos:
+                if o.rede not in por_rede:
+                    por_rede[o.rede] = o
+            similares = list(por_rede.values())
+
+        return {
+            'produto': _oferta_dict(produto),
+            'em_outras_redes': [_oferta_dict(o) for o in similares],
+        }
+    finally:
+        db.close()
+
+
+@app.get('/categorias')
+def listar_categorias():
+    """Lista todas as categorias disponíveis."""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import distinct
+        cats = [
+            r[0] for r in
+            db.query(distinct(Oferta.categoria))
+            .filter(Oferta.categoria.isnot(None))
+            .order_by(Oferta.categoria)
+            .all()
+        ]
+        return {'categorias': cats}
     finally:
         db.close()
 
 
 @app.get('/lista-de-compras')
 def calcular_lista(produtos: str = Query(...)):
+    """
+    Recebe lista de produtos separados por vírgula.
+    Busca com múltiplas palavras e calcula qual rede sai mais barato no total.
+    """
     items = [p.strip() for p in produtos.split(',') if p.strip()]
     if not items:
         raise HTTPException(400, 'Lista vazia')
 
     db = SessionLocal()
     try:
-        resultado     = {}
+        resultado      = {}
         total_por_rede = {}
 
         for item in items:
-            ofertas = db.query(Oferta).filter(
-                Oferta.nome.ilike(f'%{item}%')
-            ).order_by(Oferta.preco.asc()).all()
+            filtros = _filtro_palavras(item)
+            ofertas = (
+                db.query(Oferta)
+                .filter(*filtros)
+                .order_by(Oferta.preco.asc())
+                .all()
+            )
+
+            # Fallback para primeira palavra se não encontrou
+            if not ofertas and len(item.split()) > 1:
+                primeira = item.split()[0]
+                ofertas = (
+                    db.query(Oferta)
+                    .filter(Oferta.nome.ilike(f'%{primeira}%'))
+                    .order_by(Oferta.preco.asc())
+                    .all()
+                )
 
             por_rede = {}
             for o in ofertas:
